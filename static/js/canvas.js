@@ -129,6 +129,70 @@ function bindCanvasPreviewImageFallbacks(root=document){
         });
     });
 }
+const CANVAS_SELECTED_HIGH_RES_DELAY = 320;
+let canvasSelectedHighResTimer = 0;
+let canvasSelectedHighResSeq = 0;
+const canvasSelectedHighResLoaded = new Set();
+const canvasSelectedHighResLoading = new Map();
+function canvasImageEditorIsOpen(){
+    return Boolean(document.getElementById('imageEditModal')?.classList.contains('open'));
+}
+function preloadCanvasSelectedHighRes(src){
+    if(!src || canvasSelectedHighResLoaded.has(src)) return Promise.resolve(true);
+    if(canvasSelectedHighResLoading.has(src)) return canvasSelectedHighResLoading.get(src);
+    const task = new Promise(resolve => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = async () => {
+            try { if(img.decode) await img.decode(); } catch(e) {}
+            canvasSelectedHighResLoaded.add(src);
+            resolve(true);
+        };
+        img.onerror = () => resolve(false);
+        img.src = src;
+    }).finally(() => canvasSelectedHighResLoading.delete(src));
+    canvasSelectedHighResLoading.set(src, task);
+    return task;
+}
+function syncCanvasSelectedImageResolution(root=nodesEl){
+    const selectedImages = [];
+    root.querySelectorAll?.('.node img[data-preview-src][data-original-src]').forEach(img => {
+        if(img.dataset.previewKind === 'video') return;
+        const nodeEl = img.closest('.node');
+        const selectedNode = Boolean(nodeEl?.dataset?.id && selected.has(nodeEl.dataset.id));
+        const preview = img.dataset.previewSrc || '';
+        const original = img.dataset.originalSrc || img.dataset.url || '';
+        if(!selectedNode){
+            delete img.dataset.selectedHighResTarget;
+            if(preview && img.getAttribute('src') !== preview) img.src = preview;
+            return;
+        }
+        const target = canvasDisplayMediaUrl(original);
+        if(!target) return;
+        img.dataset.selectedHighResTarget = target;
+        if(canvasSelectedHighResLoaded.has(target)){
+            if(img.getAttribute('src') !== target) img.src = target;
+            return;
+        }
+        if(preview && img.getAttribute('src') !== preview) img.src = preview;
+        selectedImages.push({img, target});
+    });
+    if(canvasSelectedHighResTimer) clearTimeout(canvasSelectedHighResTimer);
+    const seq = ++canvasSelectedHighResSeq;
+    if(!selectedImages.length || canvasImageEditorIsOpen()) return;
+    canvasSelectedHighResTimer = setTimeout(async () => {
+        canvasSelectedHighResTimer = 0;
+        if(seq !== canvasSelectedHighResSeq || canvasImageEditorIsOpen()) return;
+        await Promise.all(selectedImages.map(item => preloadCanvasSelectedHighRes(item.target)));
+        if(seq !== canvasSelectedHighResSeq || canvasImageEditorIsOpen()) return;
+        selectedImages.forEach(({img, target}) => {
+            if(!img.isConnected || img.dataset.selectedHighResTarget !== target) return;
+            const nodeEl = img.closest('.node');
+            if(!nodeEl?.dataset?.id || !selected.has(nodeEl.dataset.id)) return;
+            if(canvasSelectedHighResLoaded.has(target) && img.getAttribute('src') !== target) img.src = target;
+        });
+    }, CANVAS_SELECTED_HIGH_RES_DELAY);
+}
 function applyLanguage(lang){
     if(lang && window.StudioI18n) StudioI18n.set(lang);
     document.title = tr('canvas.title');
@@ -383,6 +447,7 @@ let cropAspectPreset = 'free';
 let cropAspectRatio = null;
 let imageEditMode = 'crop';
 let imageEditModeTouched = false;
+let imageResizeScale = 0.5;
 let editDrawState = null;
 let editTextItems = [];
 let editTextSelectedId = '';
@@ -975,6 +1040,37 @@ function formatCanvasTime(value){
 function setStatus(text){
     document.getElementById('saveState').textContent = text;
     if(gateStatus) gateStatus.textContent = text;
+}
+let generationCompleteSoundAt = 0;
+function playGenerationCompleteSound(){
+    const now = Date.now();
+    if(now - generationCompleteSoundAt < 1200) return;
+    generationCompleteSoundAt = now;
+    try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if(!AudioCtx) return;
+        const ctx = playGenerationCompleteSound._ctx || (playGenerationCompleteSound._ctx = new AudioCtx());
+        const play = () => {
+            const start = ctx.currentTime + 0.015;
+            [
+                {freq:660, at:0, duration:0.12},
+                {freq:880, at:0.12, duration:0.16}
+            ].forEach(tone => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(tone.freq, start + tone.at);
+                gain.gain.setValueAtTime(0.0001, start + tone.at);
+                gain.gain.exponentialRampToValueAtTime(0.075, start + tone.at + 0.018);
+                gain.gain.exponentialRampToValueAtTime(0.0001, start + tone.at + tone.duration);
+                osc.connect(gain).connect(ctx.destination);
+                osc.start(start + tone.at);
+                osc.stop(start + tone.at + tone.duration + 0.02);
+            });
+        };
+        if(ctx.state === 'suspended') ctx.resume().then(play).catch(() => {});
+        else play();
+    } catch(e) {}
 }
 function refreshGateViewControls(){
     if(!canvasGate) return;
@@ -2293,6 +2389,9 @@ document.getElementById('editTextCanvas')?.addEventListener('dblclick', event =>
         syncGridGapValue();
         refreshGridSplitPreview();
     });
+});
+['imageResizeScaleRange','imageResizeScaleInput'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', event => setImageResizeScale(event.target.value));
 });
 // 图片编辑区滚轮缩放
 document.getElementById('imageEditStage').addEventListener('wheel', event => {
@@ -4392,12 +4491,13 @@ function setImageEditMode(mode, userTouched=false){
     if(userTouched) imageEditModeTouched = true;
     const prevImageEditMode = imageEditMode;
     if(mode !== 'brush') removeEditTextInlineEditor(true);
-    imageEditMode = ['preview','crop','outpaint','mask','brush','grid'].includes(mode) ? mode : 'crop';
+    imageEditMode = ['preview','crop','outpaint','mask','brush','resize','grid'].includes(mode) ? mode : 'crop';
     const isPreview = imageEditMode === 'preview';
     const cropCanvasEl = document.getElementById('cropCanvas');
     cropCanvasEl.classList.toggle('preview-mode', isPreview);
     cropCanvasEl.classList.toggle('mask-mode', imageEditMode === 'mask');
     cropCanvasEl.classList.toggle('brush-mode', imageEditMode === 'brush');
+    cropCanvasEl.classList.toggle('resize-mode', imageEditMode === 'resize');
     cropCanvasEl.classList.toggle('grid-mode', imageEditMode === 'grid');
     cropCanvasEl.classList.toggle('outpaint-mode', imageEditMode === 'outpaint');
     _syncGridCustomCursor();
@@ -4405,8 +4505,10 @@ function setImageEditMode(mode, userTouched=false){
     document.getElementById('imageCropTools')?.classList.toggle('active', imageEditMode === 'crop');
     document.getElementById('imageMaskTools').classList.toggle('active', imageEditMode === 'mask');
     document.getElementById('imageBrushTools').classList.toggle('active', imageEditMode === 'brush');
+    document.getElementById('imageResizeTools')?.classList.toggle('active', imageEditMode === 'resize');
     document.getElementById('imageGridTools').classList.toggle('active', imageEditMode === 'grid');
     syncGridGapValue();
+    syncImageResizeControls();
     const title = document.getElementById('imageEditTitle');
     const sub = document.getElementById('imageEditSub');
     const apply = document.getElementById('imageEditApplyBtn');
@@ -4416,19 +4518,25 @@ function setImageEditMode(mode, userTouched=false){
         sub.textContent = tr('canvas.previewHint');
     } else {
         apply.style.display = '';
-        const icon = imageEditMode === 'crop' ? 'crop' : imageEditMode === 'outpaint' ? 'expand' : imageEditMode === 'mask' ? 'brush' : imageEditMode === 'brush' ? 'paintbrush' : 'grid-3x3';
-        const labelKey = imageEditMode === 'crop' ? 'canvas.applyCrop' : imageEditMode === 'outpaint' ? 'canvas.applyOutpaint' : imageEditMode === 'mask' ? 'canvas.applyMask' : imageEditMode === 'brush' ? 'canvas.applyBrush' : 'canvas.applyGrid';
-        const titleKey = imageEditMode === 'crop' ? 'canvas.cropImage' : imageEditMode === 'outpaint' ? 'canvas.outpaintImage' : imageEditMode === 'mask' ? 'canvas.maskEdit' : imageEditMode === 'brush' ? 'canvas.brushEdit' : 'canvas.modeGrid';
-        const subKey = imageEditMode === 'crop' ? 'canvas.cropHint' : imageEditMode === 'outpaint' ? 'canvas.outpaintHint' : imageEditMode === 'mask' ? 'canvas.maskHint2' : imageEditMode === 'brush' ? 'canvas.brushHint' : 'canvas.gridHint';
-        title.textContent = tr(titleKey);
-        sub.textContent = tr(subKey);
-        apply.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4"></i><span>${tr(labelKey)}</span>`;
+        if(imageEditMode === 'resize'){
+            title.textContent = '缩放图片';
+            sub.textContent = '选择缩小倍数，应用会替换当前原图';
+            apply.innerHTML = `<i data-lucide="minimize-2" class="w-4 h-4"></i><span>应用缩放</span>`;
+        } else {
+            const icon = imageEditMode === 'crop' ? 'crop' : imageEditMode === 'outpaint' ? 'expand' : imageEditMode === 'mask' ? 'brush' : imageEditMode === 'brush' ? 'paintbrush' : 'grid-3x3';
+            const labelKey = imageEditMode === 'crop' ? 'canvas.applyCrop' : imageEditMode === 'outpaint' ? 'canvas.applyOutpaint' : imageEditMode === 'mask' ? 'canvas.applyMask' : imageEditMode === 'brush' ? 'canvas.applyBrush' : 'canvas.applyGrid';
+            const titleKey = imageEditMode === 'crop' ? 'canvas.cropImage' : imageEditMode === 'outpaint' ? 'canvas.outpaintImage' : imageEditMode === 'mask' ? 'canvas.maskEdit' : imageEditMode === 'brush' ? 'canvas.brushEdit' : 'canvas.modeGrid';
+            const subKey = imageEditMode === 'crop' ? 'canvas.cropHint' : imageEditMode === 'outpaint' ? 'canvas.outpaintHint' : imageEditMode === 'mask' ? 'canvas.maskHint2' : imageEditMode === 'brush' ? 'canvas.brushHint' : 'canvas.gridHint';
+            title.textContent = tr(titleKey);
+            sub.textContent = tr(subKey);
+            apply.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4"></i><span>${tr(labelKey)}</span>`;
+        }
     }
     resizeEditDrawCanvas();
     if(isPreview) clearEditDrawing(true);
     else if(imageEditMode === 'grid') refreshGridSplitPreview();
     else if(imageEditMode === 'outpaint') resetOutpaintBox();
-    else if(imageEditMode === 'crop') clearEditDrawing(true);
+    else if(imageEditMode === 'crop' || imageEditMode === 'resize') clearEditDrawing(true);
     else if(prevImageEditMode === 'grid') clearEditDrawing(true); // 离开 grid 时主动清掉画布上残留的分割线预览
     syncEditDrawingHistoryButtons();
     syncBrushToolButtons();
@@ -4848,6 +4956,55 @@ function _syncGridCustomUndoBtn(){
     btn.disabled = gridCustomHistory.length === 0;
     btn.style.opacity = gridCustomHistory.length === 0 ? '0.4' : '1';
 }
+function clampImageResizeScale(value){
+    const num = Number(value);
+    if(!Number.isFinite(num)) return 0.5;
+    return Math.max(0.05, Math.min(1, Math.round(num * 100) / 100));
+}
+function imageResizeDimensions(){
+    const img = document.getElementById('cropImage');
+    const sourceW = Math.max(1, Math.round(Number(img?.naturalWidth || 0)));
+    const sourceH = Math.max(1, Math.round(Number(img?.naturalHeight || 0)));
+    const scale = clampImageResizeScale(imageResizeScale);
+    return {
+        sourceW,
+        sourceH,
+        scale,
+        targetW:Math.max(1, Math.round(sourceW * scale)),
+        targetH:Math.max(1, Math.round(sourceH * scale))
+    };
+}
+function syncImageResizeControls(){
+    imageResizeScale = clampImageResizeScale(imageResizeScale);
+    const range = document.getElementById('imageResizeScaleRange');
+    const input = document.getElementById('imageResizeScaleInput');
+    const label = document.getElementById('imageResizeResolution');
+    const overlay = document.getElementById('resizeResolutionOverlay');
+    const dims = imageResizeDimensions();
+    const text = `${dims.targetW}×${dims.targetH}`;
+    if(range && Number(range.value) !== dims.scale) range.value = String(dims.scale);
+    if(input && Number(input.value) !== dims.scale) input.value = String(dims.scale);
+    if(label) label.textContent = text;
+    if(overlay) overlay.textContent = text;
+}
+function setImageResizeScale(value){
+    imageResizeScale = clampImageResizeScale(value);
+    syncImageResizeControls();
+}
+async function resizedImageBlobFromEditor(){
+    const img = document.getElementById('cropImage');
+    if(!img?.naturalWidth || !img?.naturalHeight) return null;
+    const dims = imageResizeDimensions();
+    const canvasEl = document.createElement('canvas');
+    canvasEl.width = dims.targetW;
+    canvasEl.height = dims.targetH;
+    const ctx = canvasEl.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, 0, 0, dims.targetW, dims.targetH);
+    const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
+    return blob ? {blob, ...dims} : null;
+}
 // ——— 图片缩放 ———
 function applyImageEditZoom(){
     if(!imageEditBaseW) return;
@@ -4869,6 +5026,7 @@ function applyImageEditZoom(){
         renderCropBox();
     }
     if(imageEditMode === 'grid') refreshGridSplitPreview();
+    syncImageResizeControls();
     syncImageEditOverflow();
     _updateZoomLabel();
 }
@@ -5140,7 +5298,7 @@ function openImageEditor(nodeId, initialMode='crop'){
     const node = nodes.find(n => n.id === nodeId);
     if(!node?.url) return;
     if(mediaKindForNode(node) !== 'image') return;
-    if(!['preview','crop','outpaint','mask','brush','grid'].includes(initialMode)) initialMode = 'crop';
+    if(!['preview','crop','outpaint','mask','brush','resize','grid'].includes(initialMode)) initialMode = 'crop';
     cropState = {nodeId, x:0, y:0, w:0, h:0};
     // 重置自定义宫格状态
     gridCustomMode = false;
@@ -5151,6 +5309,7 @@ function openImageEditor(nodeId, initialMode='crop'){
     imageEditZoom = 1.0;
     imageEditBaseW = 0;
     imageEditBaseH = 0;
+    imageResizeScale = 0.5;
     imageEditModeTouched = false;
     cropAspectPreset = 'free';
     cropAspectRatio = null;
@@ -5177,11 +5336,14 @@ function openImageEditor(nodeId, initialMode='crop'){
     img.style.maxWidth = '';
     img.style.maxHeight = '';
     modal.classList.add('open');
+    const editorSrcToken = `${nodeId}:${Date.now()}`;
+    img.dataset.editorSrcToken = editorSrcToken;
     img.onload = () => {
         // 记录 zoom=1 时的基础显示尺寸
         imageEditBaseW = img.clientWidth;
         imageEditBaseH = img.clientHeight;
         _updateZoomLabel();
+        syncImageResizeControls();
         resizeEditDrawCanvas();
         resetEditDrawingHistory();
         clearEditDrawing(true);
@@ -5191,7 +5353,20 @@ function openImageEditor(nodeId, initialMode='crop'){
         refreshIcons();
     };
     img.crossOrigin = 'anonymous';
-    img.src = node.url;
+    const fullEditorSrc = canvasDisplayMediaUrl(node.url, node.name || '');
+    const quickEditorSrc = canvasMediaPreviewUrl(node.url, initialMode === 'preview' ? 1536 : 2048);
+    if(quickEditorSrc && quickEditorSrc !== fullEditorSrc){
+        img.src = quickEditorSrc;
+        requestAnimationFrame(() => {
+            setTimeout(() => {
+                if(!cropState || cropState.nodeId !== nodeId) return;
+                if(!modal.classList.contains('open') || img.dataset.editorSrcToken !== editorSrcToken) return;
+                if(img.getAttribute('src') !== fullEditorSrc) img.src = fullEditorSrc;
+            }, initialMode === 'preview' ? 120 : 60);
+        });
+    } else {
+        img.src = fullEditorSrc;
+    }
     setImageEditMode(initialMode);
     refreshIcons();
 }
@@ -5199,6 +5374,7 @@ function closeImageEditor(){
     document.getElementById('imageEditModal').classList.remove('open');
     const img = document.getElementById('cropImage');
     img.onload = null;
+    delete img.dataset.editorSrcToken;
     img.removeAttribute('src');
     img.style.width = '';
     img.style.height = '';
@@ -5213,13 +5389,14 @@ function closeImageEditor(){
     imageEditZoom = 1.0;
     imageEditBaseW = 0;
     imageEditBaseH = 0;
+    imageResizeScale = 0.5;
     imageEditModeTouched = false;
     cropAspectPreset = 'free';
     cropAspectRatio = null;
     syncCropRatioButtons();
     document.getElementById('imageEditStage')?.classList.remove('overflowing', 'overflow-x', 'overflow-y');
     const cropCanvasEl = document.getElementById('cropCanvas');
-    cropCanvasEl.classList.remove('grid-custom-h', 'grid-custom-v', 'outpaint-mode', 'outpaint-warning', 'dragging-image', 'text-mode');
+    cropCanvasEl.classList.remove('grid-custom-h', 'grid-custom-v', 'outpaint-mode', 'outpaint-warning', 'dragging-image', 'text-mode', 'resize-mode');
     cropCanvasEl.style.width = '';
     cropCanvasEl.style.height = '';
     const textCanvas = editTextCanvas();
@@ -5534,10 +5711,36 @@ async function applyImageGridSplit(){
         scheduleSave();
     }
 }
+async function applyImageResize(){
+    if(!cropState) return;
+    const node = nodes.find(n => n.id === cropState.nodeId);
+    if(!node) return;
+    let resized = null;
+    try {
+        resized = await resizedImageBlobFromEditor();
+    } catch(err) {
+        alert('缩放失败：当前图片无法写入画布，请换成本地图片或重新上传后再试。');
+        return;
+    }
+    if(!resized?.blob) return;
+    const base = (node.name || 'image').replace(/\.[^.]+$/, '');
+    const suffix = `${Math.round(resized.scale * 100)}pct`;
+    const file = await uploadCroppedBlob(resized.blob, `${base}_resize_${suffix}.png`);
+    if(!file) return;
+    node.url = file.url;
+    node.name = file.name;
+    node.mediaKind = 'image';
+    node.natural_w = resized.targetW;
+    node.natural_h = resized.targetH;
+    closeImageEditor();
+    render();
+    scheduleSave();
+}
 function applyImageEdit(){
     if(imageEditMode === 'outpaint') return applyImageOutpaint();
     if(imageEditMode === 'mask') return applyImageMask();
     if(imageEditMode === 'brush') return applyImageBrush();
+    if(imageEditMode === 'resize') return applyImageResize();
     if(imageEditMode === 'grid') return applyImageGridSplit();
     return applyImageCrop();
 }
@@ -5660,6 +5863,7 @@ function render(){
     refreshGeometryAfterLayout();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
+    syncCanvasSelectedImageResolution(nodesEl);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
 }
@@ -5690,6 +5894,7 @@ function refreshNodes(ids=[]){
     refreshGeometryAfterLayout();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
+    syncCanvasSelectedImageResolution(nodesEl);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
 }
@@ -6184,6 +6389,8 @@ function refreshOutputNodeContent(node){
         }
         grid.appendChild(child);
     });
+    bindCanvasPreviewImageFallbacks(grid);
+    syncCanvasSelectedImageResolution(el);
     refreshOutputTimer();
     return true;
 }
@@ -11620,6 +11827,7 @@ function logTaskLabel(log){
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
+    if(!error && (outputs || []).some(item => outputUrlValue(item))) playGenerationCompleteSound();
     const entry = {
         id:uid('log'),
         createdAt:Date.now(),
@@ -13017,6 +13225,46 @@ function cloneNode(n, dx, dy){
     copy.running = false;
     return copy;
 }
+function duplicateNodesForAltDrag(node, preserveConnections=false){
+    const copy = cloneNode(node, 0, 0);
+    const sourceIds = new Set([node.id]);
+    const idMap = new Map([[node.id, copy.id]]);
+    const copies = [copy];
+    const isGroup = node.type === 'group' || node.type === 'promptGroup';
+    if(isGroup && node.items?.length){
+        const childCopies = node.items
+            .map(id => nodes.find(n => n.id === id))
+            .filter(Boolean)
+            .map(child => {
+                const childCopy = cloneNode(child, 0, 0);
+                sourceIds.add(child.id);
+                idMap.set(child.id, childCopy.id);
+                copies.push(childCopy);
+                return childCopy;
+            });
+        copy.items = copy.items.map(id => idMap.get(id) || id);
+        nodes.push(...childCopies, copy);
+    } else {
+        nodes.push(copy);
+    }
+    if(preserveConnections){
+        const copiedConnections = (connections || [])
+            .filter(conn => sourceIds.has(conn.from) || sourceIds.has(conn.to))
+            .map(conn => ({
+                ...conn,
+                id:uid('c'),
+                from:idMap.get(conn.from) || conn.from,
+                to:idMap.get(conn.to) || conn.to
+            }))
+            .filter(conn => conn.from && conn.to && conn.from !== conn.to);
+        copiedConnections.forEach(conn => {
+            if(canConnect(conn.from, conn.to) && !connections.some(c => c.from === conn.from && c.to === conn.to)){
+                connections.push(conn);
+            }
+        });
+    }
+    return copy;
+}
 function copySelectedNodes(){
     if(!canvas || !selected.size) return;
     const el = document.activeElement;
@@ -13300,21 +13548,15 @@ function startNodeDrag(e, node){
     e.stopPropagation();
     let dragTarget = node;
     if(e.altKey){
-        const copy = cloneNode(node, 0, 0);
-        const isGroup = node.type === 'group' || node.type === 'promptGroup';
-        if(isGroup && node.items?.length){
-            const idMap = new Map();
-            const childCopies = node.items
-                .map(id => nodes.find(n => n.id === id)).filter(Boolean)
-                .map(child => { const cc = cloneNode(child, 0, 0); idMap.set(child.id, cc.id); return cc; });
-            copy.items = copy.items.map(id => idMap.get(id) || id);
-            nodes.push(...childCopies, copy);
-        } else {
-            nodes.push(copy);
-        }
+        setKnifeMode(false);
+        const copy = duplicateNodesForAltDrag(node, e.shiftKey);
         selected.clear();
         selected.add(copy.id);
         dragTarget = copy;
+        if(e.shiftKey){
+            sanitizeConnections();
+            syncGeneratorInputs();
+        }
         render();
     }
     const isGroup = dragTarget.type === 'group' || dragTarget.type === 'promptGroup';
@@ -13760,9 +14002,8 @@ function renderLinks(){
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
         segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
     });
-    const hasSelection = selected.size > 0;
     segments.forEach(({c, a, b}) => {
-        const relClass = isConnectionSelected(c) ? ' link-active' : hasSelection ? ' link-dim' : '';
+        const relClass = isConnectionSelected(c) ? ' link-active' : '';
         linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link${relClass}`));
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
@@ -13849,6 +14090,7 @@ function refreshSelectionVisuals(){
     nodesEl.querySelectorAll('.node').forEach(el => {
         el.classList.toggle('selected', selected.has(el.dataset.id));
     });
+    syncCanvasSelectedImageResolution(nodesEl);
     renderLinks();
     renderSelectionHub();
     if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
@@ -13939,7 +14181,7 @@ function setKnifeMode(active){
     }
 }
 function startKnifeDrag(e){
-    if(!canvas || e.button !== 0 || !e.shiftKey || isEditableTarget(e.target)) return false;
+    if(!canvas || e.button !== 0 || !e.shiftKey || e.altKey || isEditableTarget(e.target)) return false;
     e.preventDefault();
     e.stopPropagation();
     e.stopImmediatePropagation?.();
@@ -14170,7 +14412,7 @@ window.addEventListener('keydown', e => {
     if(!canvas) return;
     const key = String(e.key || '').toLowerCase();
     if(key === 'r' && !isEditableTarget(e.target)) isRKeyDown = true;
-    if(e.key === 'Shift' && !isEditableTarget(document.activeElement)) setKnifeMode(true);
+    if(e.key === 'Shift' && !e.altKey && !isEditableTarget(document.activeElement)) setKnifeMode(true);
     if(e.key === 'Escape' && document.getElementById('imageEditModal').classList.contains('open')) { closeImageEditor(); return; }
     if(e.key === 'Escape' && promptTemplateModal?.classList.contains('open')) { closePromptTemplateModal(); return; }
     if(outputLightbox.classList.contains('open') && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')){

@@ -228,6 +228,7 @@ let cropAspectPreset = 'free';
 let cropAspectRatio = null;
 let imageEditMode = 'crop';
 let imageEditModeTouched = false;
+let imageResizeScale = 0.5;
 let editDrawState = null;
 let editTextItems = [];
 let editTextSelectedId = '';
@@ -551,6 +552,70 @@ function bindSmartPreviewImageFallbacks(root=document){
             if(original && img.getAttribute('src') !== original) img.src = original;
         });
     });
+}
+const SMART_SELECTED_HIGH_RES_DELAY = 320;
+let smartSelectedHighResTimer = 0;
+let smartSelectedHighResSeq = 0;
+const smartSelectedHighResLoaded = new Set();
+const smartSelectedHighResLoading = new Map();
+function smartImageEditorIsOpen(){
+    return Boolean(imageEditModal?.classList?.contains('open'));
+}
+function preloadSmartSelectedHighRes(src){
+    if(!src || smartSelectedHighResLoaded.has(src)) return Promise.resolve(true);
+    if(smartSelectedHighResLoading.has(src)) return smartSelectedHighResLoading.get(src);
+    const task = new Promise(resolve => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = async () => {
+            try { if(img.decode) await img.decode(); } catch(e) {}
+            smartSelectedHighResLoaded.add(src);
+            resolve(true);
+        };
+        img.onerror = () => resolve(false);
+        img.src = src;
+    }).finally(() => smartSelectedHighResLoading.delete(src));
+    smartSelectedHighResLoading.set(src, task);
+    return task;
+}
+function syncSmartSelectedImageResolution(root=world){
+    const selectedImages = [];
+    root.querySelectorAll?.('.image-node img[data-preview-src][data-original-src]').forEach(img => {
+        if(img.dataset.previewKind === 'video') return;
+        const nodeEl = img.closest('.image-node');
+        const selectedNode = Boolean(nodeEl?.dataset?.id && isNodeSelected(nodeEl.dataset.id));
+        const preview = img.dataset.previewSrc || '';
+        const original = img.dataset.originalSrc || '';
+        if(!selectedNode){
+            delete img.dataset.selectedHighResTarget;
+            if(preview && img.getAttribute('src') !== preview) img.src = preview;
+            return;
+        }
+        const target = displayMediaUrl({url:smartOriginalMediaUrl(original)});
+        if(!target) return;
+        img.dataset.selectedHighResTarget = target;
+        if(smartSelectedHighResLoaded.has(target)){
+            if(img.getAttribute('src') !== target) img.src = target;
+            return;
+        }
+        if(preview && img.getAttribute('src') !== preview) img.src = preview;
+        selectedImages.push({img, target});
+    });
+    if(smartSelectedHighResTimer) clearTimeout(smartSelectedHighResTimer);
+    const seq = ++smartSelectedHighResSeq;
+    if(!selectedImages.length || smartImageEditorIsOpen()) return;
+    smartSelectedHighResTimer = setTimeout(async () => {
+        smartSelectedHighResTimer = 0;
+        if(seq !== smartSelectedHighResSeq || smartImageEditorIsOpen()) return;
+        await Promise.all(selectedImages.map(item => preloadSmartSelectedHighRes(item.target)));
+        if(seq !== smartSelectedHighResSeq || smartImageEditorIsOpen()) return;
+        selectedImages.forEach(({img, target}) => {
+            if(!img.isConnected || img.dataset.selectedHighResTarget !== target) return;
+            const nodeEl = img.closest('.image-node');
+            if(!nodeEl?.dataset?.id || !isNodeSelected(nodeEl.dataset.id)) return;
+            if(smartSelectedHighResLoaded.has(target) && img.getAttribute('src') !== target) img.src = target;
+        });
+    }, SMART_SELECTED_HIGH_RES_DELAY);
 }
 function cloneSmartSettings(source=settings){
     try {
@@ -1102,6 +1167,37 @@ function toast(text){
     clearTimeout(toast._timer);
     toast._timer = setTimeout(() => el.classList.remove('show'), 1800);
 }
+let generationCompleteSoundAt = 0;
+function playGenerationCompleteSound(){
+    const now = Date.now();
+    if(now - generationCompleteSoundAt < 1200) return;
+    generationCompleteSoundAt = now;
+    try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if(!AudioCtx) return;
+        const ctx = playGenerationCompleteSound._ctx || (playGenerationCompleteSound._ctx = new AudioCtx());
+        const play = () => {
+            const start = ctx.currentTime + 0.015;
+            [
+                {freq:660, at:0, duration:0.12},
+                {freq:880, at:0.12, duration:0.16}
+            ].forEach(tone => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(tone.freq, start + tone.at);
+                gain.gain.setValueAtTime(0.0001, start + tone.at);
+                gain.gain.exponentialRampToValueAtTime(0.075, start + tone.at + 0.018);
+                gain.gain.exponentialRampToValueAtTime(0.0001, start + tone.at + tone.duration);
+                osc.connect(gain).connect(ctx.destination);
+                osc.start(start + tone.at);
+                osc.stop(start + tone.at + tone.duration + 0.02);
+            });
+        };
+        if(ctx.state === 'suspended') ctx.resume().then(play).catch(() => {});
+        else play();
+    } catch(e) {}
+}
 function selectedNode(){ return nodes.find(n => n.id === selectedId) || null; }
 function clearSelection(){
     savePromptDraftForCurrent();
@@ -1127,6 +1223,7 @@ function syncSelectionUi(){
             item.classList.toggle('image-selected', selectedImage.nodeId === id && selectedImage.index === index);
         });
     });
+    syncSmartSelectedImageResolution(world);
     syncRunButtonState();
     scheduleConnectionLayerRefresh();
 }
@@ -5831,7 +5928,7 @@ function pasteAssetsFromInbox(){
     toast(`已粘贴 ${created.length} 个素材到画布`);
     return true;
 }
-function duplicateForAltDrag(node){
+function duplicateForAltDrag(node, preserveConnections=false){
     const ids = (isNodeSelected(node.id) ? selectedNodeIds() : [node.id]);
     const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
     if(!sourceNodes.length) return node;
@@ -5843,13 +5940,31 @@ function duplicateForAltDrag(node){
         return copy;
     });
     copies.forEach(copy => {
-        if(Array.isArray(copy.inputNodeIds)) copy.inputNodeIds = copy.inputNodeIds.map(id => idMap.get(id)).filter(Boolean);
-        if(copy.sourceNodeId) copy.sourceNodeId = idMap.get(copy.sourceNodeId) || '';
+        if(Array.isArray(copy.inputNodeIds)){
+            copy.inputNodeIds = preserveConnections
+                ? copy.inputNodeIds.map(id => idMap.get(id) || id).filter(Boolean)
+                : [];
+        }
+        if(copy.sourceNodeId) copy.sourceNodeId = preserveConnections ? (idMap.get(copy.sourceNodeId) || copy.sourceNodeId) : '';
     });
-    const idSet = new Set(sourceNodes.map(n => n.id));
-    const copiedConnections = (canvas.connections || []).filter(c => idSet.has(c.from) && idSet.has(c.to));
-    const newConnections = copiedConnections.map(conn => ({...conn, from:idMap.get(conn.from), to:idMap.get(conn.to)})).filter(conn => conn.from && conn.to && conn.from !== conn.to);
-    canvas.connections = [...(canvas.connections || []), ...newConnections];
+    if(preserveConnections){
+        const idSet = new Set(sourceNodes.map(n => n.id));
+        const newConnections = (canvas.connections || [])
+            .filter(conn => idSet.has(conn.from) || idSet.has(conn.to))
+            .map(conn => ({...conn, from:idMap.get(conn.from) || conn.from, to:idMap.get(conn.to) || conn.to}))
+            .filter(conn => conn.from && conn.to && conn.from !== conn.to);
+        const nextConnections = [...(canvas.connections || [])];
+        newConnections.forEach(conn => {
+            const kind = conn.kind || 'flow';
+            if(nextConnections.some(c => c.from === conn.from && c.to === conn.to && (c.kind || 'flow') === kind)) return;
+            nextConnections.push(conn);
+            const toNode = nodes.find(n => n.id === conn.to) || copies.find(n => n.id === conn.to);
+            if(toNode && (conn.kind || 'flow') === 'input'){
+                toNode.inputNodeIds = Array.from(new Set([...(toNode.inputNodeIds || []), conn.from]));
+            }
+        });
+        canvas.connections = nextConnections;
+    }
     nodes.push(...copies);
     selectedId = '';
     selectedIds = [];
@@ -5926,7 +6041,7 @@ function renderConnections(){
             isCascade && Boolean(cascadeState) && cascadeState !== 'done' ? 'conn-cascade-wait' : '',
             isCascade && cascadeState === 'active' ? 'conn-cascade-active' : '',
             isHistory ? 'conn-history' : '',
-            isSelectedLine ? 'conn-selected' : selectedConnIds.size ? 'conn-dim' : ''
+            isSelectedLine ? 'conn-selected' : ''
         ].filter(Boolean).join(' ');
         const color = isCascade ? '#16a34a' : isHistory ? 'rgba(100,116,139,0.46)' : kind === 'input' ? 'rgba(100,116,139,0.62)' : 'rgba(148,163,184,0.62)';
         const opacity = isPendingLine ? '.82' : '1';
@@ -6195,6 +6310,16 @@ function imageResolutionLabel(img){
 function imageResolutionBadgeHtml(img){
     const label = imageResolutionLabel(img);
     return label ? `<span class="image-resolution-badge">${escapeHtml(label)}</span>` : '';
+}
+function imageNameLabel(img, fallback='image'){
+    const raw = String(img?.name || fileNameFromUrl(img?.url || '') || fallback || 'image').trim();
+    return raw || 'image';
+}
+function imageNameBadgeHtml(img, options={}){
+    if(!img?.url) return '';
+    const label = imageNameLabel(img);
+    const outsideClass = options.outside ? ' image-name-badge-outside' : '';
+    return `<span class="image-name-badge${outsideClass}" data-image-name="1" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
 }
 function thumbDisplaySize(img, maxSize){
     const limit = Math.max(28, Math.round(Number(maxSize) || 96));
@@ -6527,6 +6652,7 @@ function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
             name:item.name || item.filename || ''
         });
     }).filter(item => item?.url);
+    if(!error && outputItems.length) playGenerationCompleteSound();
     const entry = {
         id:uid('log'),
         createdAt:Date.now(),
@@ -6914,7 +7040,7 @@ function smartGroupBodyHtml(node){
             const canDelete = ref.nodeId === node.id;
             return `<div class="smart-group-card has-thumbs">
                 <div class="smart-group-summary"><i data-lucide="group"></i><span>${escapeHtml(summary)}</span></div>
-                <div class="image-wrap smart-group-single-thumb ${selectedImage.nodeId === ref.nodeId && Number(selectedImage.index) === Number(ref.index) ? 'image-selected' : ''}" data-ref-node-id="${escapeAttr(ref.nodeId)}" data-ref-image-index="${ref.index}" data-image-index="${ref.index}" data-media-signature="${escapeAttr(`${mediaKindForItem(ref.item)}:${ref.item?.url || ''}`)}" style="--node-img-w:${innerW}px;--node-img-h:${innerH}px">${singleMediaHtml(ref.item, innerW, innerH)}${imageResolutionBadgeHtml(ref.item)}${canDelete ? `<button class="mini-x image-delete" type="button" data-image-index="${ref.index}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button>` : ''}</div>
+                <div class="image-wrap smart-group-single-thumb ${selectedImage.nodeId === ref.nodeId && Number(selectedImage.index) === Number(ref.index) ? 'image-selected' : ''}" data-ref-node-id="${escapeAttr(ref.nodeId)}" data-ref-image-index="${ref.index}" data-image-index="${ref.index}" data-media-signature="${escapeAttr(`${mediaKindForItem(ref.item)}:${ref.item?.url || ''}`)}" style="--node-img-w:${innerW}px;--node-img-h:${innerH}px">${singleMediaHtml(ref.item, innerW, innerH)}${imageNameBadgeHtml(ref.item)}${imageResolutionBadgeHtml(ref.item)}${canDelete ? `<button class="mini-x image-delete" type="button" data-image-index="${ref.index}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button>` : ''}</div>
             </div>`;
         }
         const groupMaxVisibleRows = (groupThumbLayout.compactMembers || []).length ? Number(groupThumbLayout.rows || 1) : SMART_GROUP_MAX_VISIBLE_ROWS;
@@ -6924,7 +7050,7 @@ function smartGroupBodyHtml(node){
             <div class="smart-group-summary"><i data-lucide="group"></i><span>${escapeHtml(summary)}</span></div>
             <div class="thumb-grid smart-group-thumb-grid" data-thumb-scroll="1" style="--thumb-cols:${groupThumbLayout.cols}; --thumb-size:${groupThumbLayout.thumb}px; --thumb-max-height:${maxHeight}px">${refThumbs.map(ref => {
                 const canDelete = ref.nodeId === node.id;
-                return `<div class="thumb-item ${selectedImage.nodeId === ref.nodeId && Number(selectedImage.index) === Number(ref.index) ? 'image-selected' : ''}" data-ref-node-id="${escapeAttr(ref.nodeId)}" data-ref-image-index="${ref.index}" data-image-index="${ref.index}" data-media-signature="${escapeAttr(`${mediaKindForItem(ref.item)}:${ref.item?.url || ''}`)}">${thumbMediaHtml(ref.item)}${imageResolutionBadgeHtml(ref.item)}${canDelete ? `<button class="mini-x image-delete" type="button" data-image-index="${ref.index}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button>` : ''}</div>`;
+                return `<div class="thumb-item ${selectedImage.nodeId === ref.nodeId && Number(selectedImage.index) === Number(ref.index) ? 'image-selected' : ''}" data-ref-node-id="${escapeAttr(ref.nodeId)}" data-ref-image-index="${ref.index}" data-image-index="${ref.index}" data-media-signature="${escapeAttr(`${mediaKindForItem(ref.item)}:${ref.item?.url || ''}`)}">${thumbMediaHtml(ref.item)}${imageNameBadgeHtml(ref.item)}${imageResolutionBadgeHtml(ref.item)}${canDelete ? `<button class="mini-x image-delete" type="button" data-image-index="${ref.index}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button>` : ''}</div>`;
             }).join('')}</div>
         </div>`;
     }
@@ -6958,9 +7084,9 @@ function nodeBodyHtml(node, layout){
     if(imgs.length > 1){
         const visibleRows = Math.max(1, Math.min(MEDIA_GROUP_MAX_VISIBLE_ROWS, Number(layout.visibleRows || layout.rows || 1)));
         const maxHeight = visibleRows * Number(layout.thumb || 96) + Math.max(0, visibleRows - 1) * 8;
-        return `<div class="thumb-grid" data-thumb-scroll="1" style="--thumb-cols:${layout.cols}; --thumb-size:${layout.thumb}px; --thumb-max-height:${maxHeight}px">${imgs.map((img, i) => `<div class="thumb-item ${selectedImage.nodeId === node.id && selectedImage.index === i ? 'image-selected' : ''}" data-image-index="${i}" data-media-signature="${escapeAttr(`${mediaKindForItem(img)}:${img?.url || ''}`)}">${thumbMediaHtml(img)}${imageResolutionBadgeHtml(img)}<button class="mini-x image-delete" type="button" data-image-index="${i}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`).join('')}</div>`;
+        return `<div class="thumb-grid" data-thumb-scroll="1" style="--thumb-cols:${layout.cols}; --thumb-size:${layout.thumb}px; --thumb-max-height:${maxHeight}px">${imgs.map((img, i) => `<div class="thumb-item has-outside-image-name ${selectedImage.nodeId === node.id && selectedImage.index === i ? 'image-selected' : ''}" data-image-index="${i}" data-media-signature="${escapeAttr(`${mediaKindForItem(img)}:${img?.url || ''}`)}">${thumbMediaHtml(img)}${imageNameBadgeHtml(img, {outside:true})}${imageResolutionBadgeHtml(img)}<button class="mini-x image-delete" type="button" data-image-index="${i}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`).join('')}</div>`;
     }
-    if(imgs[0]) return `<div class="image-wrap ${selectedImage.nodeId === node.id && selectedImage.index === 0 ? 'image-selected' : ''}" data-image-index="0" data-media-signature="${escapeAttr(`${mediaKindForItem(imgs[0])}:${imgs[0]?.url || ''}`)}" style="--node-img-w:${layout.width}px;--node-img-h:${layout.height}px">${singleMediaHtml(imgs[0], layout.width, layout.height)}${imageResolutionBadgeHtml(imgs[0])}<button class="mini-x image-delete" type="button" data-image-index="0" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`;
+    if(imgs[0]) return `<div class="image-wrap has-outside-image-name ${selectedImage.nodeId === node.id && selectedImage.index === 0 ? 'image-selected' : ''}" data-image-index="0" data-media-signature="${escapeAttr(`${mediaKindForItem(imgs[0])}:${imgs[0]?.url || ''}`)}" style="--node-img-w:${layout.width}px;--node-img-h:${layout.height}px">${singleMediaHtml(imgs[0], layout.width, layout.height)}${imageNameBadgeHtml(imgs[0], {outside:true})}${imageResolutionBadgeHtml(imgs[0])}<button class="mini-x image-delete" type="button" data-image-index="0" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`;
     return `<div class="node-drop" data-upload-action="files">
         <span class="upload-node-main"><i data-lucide="upload-cloud"></i></span>
         <span class="upload-node-title">${escapeHtml(tr('smart.createImportNode'))}</span>
@@ -7264,6 +7390,7 @@ function render(){
     renderMinimap();
     if(window.lucide) lucide.createIcons();
     bindSmartPreviewImageFallbacks(world);
+    syncSmartSelectedImageResolution(world);
     measureSmartNodeImages();
     refreshRunTimerPills();
     return;
@@ -7923,6 +8050,29 @@ function bindNodeEvents(){
                 deleteImage(id, Number(btn.dataset.imageIndex));
             });
         });
+        el.querySelectorAll('.image-name-badge').forEach(badge => {
+            const item = badge.closest('[data-image-index]');
+            const targetNodeId = item?.dataset.refNodeId || id;
+            const imageIndex = Number(item?.dataset.refImageIndex ?? item?.dataset.imageIndex ?? 0);
+            badge.addEventListener('mousedown', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+            }, true);
+            badge.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+            }, true);
+            badge.addEventListener('dblclick', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                clearImageClickTimer();
+                suppressImageClickUntil = Date.now() + 260;
+                renameSmartNodeImage(targetNodeId, imageIndex);
+            }, true);
+        });
         el.querySelectorAll('.smart-video-play').forEach(btn => {
             btn.addEventListener('mousedown', e => {
                 e.preventDefault();
@@ -7957,7 +8107,7 @@ function bindNodeEvents(){
             });
             item.addEventListener('mousedown', e => {
                 if(e.target.closest('video,audio')) return;
-                if(e.button !== 0 || e.target.closest('.image-delete')) return;
+                if(e.button !== 0 || e.target.closest('.image-delete,.image-name-badge')) return;
                 if(e.detail < 2) return;
                 e.preventDefault();
                 e.stopPropagation();
@@ -7976,7 +8126,7 @@ function bindNodeEvents(){
             }, true);
             item.addEventListener('click', e => {
                 if(e.target.closest('video,audio')) return;
-                if(e.target.closest('.image-delete')) return;
+                if(e.target.closest('.image-delete,.image-name-badge')) return;
                 e.preventDefault();
                 e.stopPropagation();
                 e.stopImmediatePropagation();
@@ -8014,7 +8164,7 @@ function bindNodeEvents(){
             });
         item.addEventListener('dblclick', e => {
             if(e.target.closest('video,audio')) return;
-            if(e.target.closest('.image-delete')) return;
+            if(e.target.closest('.image-delete,.image-name-badge')) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation();
@@ -8084,7 +8234,7 @@ function bindNodeEvents(){
             if(document.activeElement?.blur) document.activeElement.blur();
             let node = nodes.find(n => n.id === id);
             if(!node) return;
-            if(e.altKey) node = duplicateForAltDrag(node);
+            if(e.altKey) node = duplicateForAltDrag(node, e.shiftKey);
             let dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
             if(isSmartGroupNode(node)){
                 const memberIds = smartGroupMembers(node).map(member => member.id);
@@ -8327,6 +8477,24 @@ function deleteImage(id, imageIndex){
     if(node.images.length <= 1) node.title = 'Image';
     if(selectedImage.nodeId === id) selectedImage = {nodeId:id, index:Math.min(selectedImage.index, node.images.length - 1)};
     if(selectedImage.index < 0) selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+}
+async function renameSmartNodeImage(nodeId, imageIndex){
+    const node = nodes.find(n => n.id === nodeId);
+    const index = Math.max(0, Number(imageIndex) || 0);
+    const image = node?.images?.[index];
+    if(!node || !image) return;
+    const current = imageNameLabel(image);
+    const name = await openAssetNameDialog({title:'重命名图片', value:current, placeholder:'图片名称', cancelValue:null});
+    if(name === null) return;
+    const next = String(name || '').trim();
+    if(!next || next === current) return;
+    pushUndo();
+    image.name = next;
+    selectedId = node.id;
+    selectedIds = [];
+    selectedImage = {nodeId:node.id, index};
     render();
     scheduleSave();
 }
@@ -8653,7 +8821,7 @@ function setImageEditMode(mode, userTouched=false){
     if(userTouched) imageEditModeTouched = true;
     const prev = imageEditMode;
     if(mode !== 'brush') removeEditTextInlineEditor(true);
-    imageEditMode = ['preview','crop','outpaint','mask','brush','grid'].includes(mode) ? mode : 'preview';
+    imageEditMode = ['preview','crop','outpaint','mask','brush','resize','grid'].includes(mode) ? mode : 'preview';
     const cropCanvasEl = document.getElementById('cropCanvas');
     const previewStageEl = document.getElementById('previewStage');
     const editStageEl = document.getElementById('imageEditStage');
@@ -8681,6 +8849,7 @@ function setImageEditMode(mode, userTouched=false){
     }
     cropCanvasEl.classList.toggle('mask-mode', imageEditMode === 'mask');
     cropCanvasEl.classList.toggle('brush-mode', imageEditMode === 'brush');
+    cropCanvasEl.classList.toggle('resize-mode', imageEditMode === 'resize');
     cropCanvasEl.classList.toggle('grid-mode', imageEditMode === 'grid');
     cropCanvasEl.classList.toggle('outpaint-mode', imageEditMode === 'outpaint');
     syncGridCustomCursor();
@@ -8689,10 +8858,12 @@ function setImageEditMode(mode, userTouched=false){
     document.getElementById('imageCropTools')?.classList.toggle('active', imageEditMode === 'crop');
     document.getElementById('imageMaskTools').classList.toggle('active', imageEditMode === 'mask');
     document.getElementById('imageBrushTools').classList.toggle('active', imageEditMode === 'brush');
+    document.getElementById('imageResizeTools')?.classList.toggle('active', imageEditMode === 'resize');
     document.getElementById('imageGridTools').classList.toggle('active', imageEditMode === 'grid');
     if(imageEditMode === 'grid' && gridOperationMode === 'join' && !canGridJoinCurrentNode()) gridOperationMode = 'split';
     syncGridOperationControls();
     syncGridGapValue();
+    syncImageResizeControls();
     const applyBtn = document.getElementById('imageEditApplyBtn');
     document.getElementById('compareToggleBtn').style.display = isPreview && !isVideoPreview ? 'inline-flex' : 'none';
     document.getElementById('panoramaToggleBtn').style.display = isPreview && !isVideoPreview ? 'inline-flex' : 'none';
@@ -8707,14 +8878,20 @@ function setImageEditMode(mode, userTouched=false){
         ensureImageEditBaseSize(true);
         applyImageEditZoom();
         applyBtn.style.display = '';
-        const icon = imageEditMode === 'crop' ? 'crop' : imageEditMode === 'outpaint' ? 'expand' : imageEditMode === 'mask' ? 'brush' : imageEditMode === 'brush' ? 'paintbrush' : 'grid-3x3';
-        const labelKey = imageEditMode === 'crop' ? 'canvas.applyCrop' : imageEditMode === 'outpaint' ? 'canvas.applyOutpaint' : imageEditMode === 'mask' ? 'canvas.applyMask' : imageEditMode === 'brush' ? 'canvas.applyBrush' : 'canvas.applyGrid';
-        const titleKey = imageEditMode === 'crop' ? 'canvas.cropImage' : imageEditMode === 'outpaint' ? 'canvas.outpaintImage' : imageEditMode === 'mask' ? 'canvas.maskEdit' : imageEditMode === 'brush' ? 'canvas.brushEdit' : 'canvas.modeGrid';
-        const subKey = imageEditMode === 'crop' ? 'canvas.cropHint' : imageEditMode === 'outpaint' ? 'canvas.outpaintHint' : imageEditMode === 'mask' ? 'canvas.maskHint2' : imageEditMode === 'brush' ? 'canvas.brushHint' : 'canvas.gridHint';
-        document.getElementById('imageEditTitle').textContent = tr(titleKey);
-        document.getElementById('imageEditSub').textContent = tr(subKey);
-        const applyLabel = imageEditMode === 'grid' && gridOperationMode === 'join' ? '输出拼接' : tr(labelKey);
-        applyBtn.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4"></i><span>${applyLabel}</span>`;
+        if(imageEditMode === 'resize'){
+            document.getElementById('imageEditTitle').textContent = '缩放图片';
+            document.getElementById('imageEditSub').textContent = '选择缩小倍数，应用会替换当前原图';
+            applyBtn.innerHTML = `<i data-lucide="minimize-2" class="w-4 h-4"></i><span>应用缩放</span>`;
+        } else {
+            const icon = imageEditMode === 'crop' ? 'crop' : imageEditMode === 'outpaint' ? 'expand' : imageEditMode === 'mask' ? 'brush' : imageEditMode === 'brush' ? 'paintbrush' : 'grid-3x3';
+            const labelKey = imageEditMode === 'crop' ? 'canvas.applyCrop' : imageEditMode === 'outpaint' ? 'canvas.applyOutpaint' : imageEditMode === 'mask' ? 'canvas.applyMask' : imageEditMode === 'brush' ? 'canvas.applyBrush' : 'canvas.applyGrid';
+            const titleKey = imageEditMode === 'crop' ? 'canvas.cropImage' : imageEditMode === 'outpaint' ? 'canvas.outpaintImage' : imageEditMode === 'mask' ? 'canvas.maskEdit' : imageEditMode === 'brush' ? 'canvas.brushEdit' : 'canvas.modeGrid';
+            const subKey = imageEditMode === 'crop' ? 'canvas.cropHint' : imageEditMode === 'outpaint' ? 'canvas.outpaintHint' : imageEditMode === 'mask' ? 'canvas.maskHint2' : imageEditMode === 'brush' ? 'canvas.brushHint' : 'canvas.gridHint';
+            document.getElementById('imageEditTitle').textContent = tr(titleKey);
+            document.getElementById('imageEditSub').textContent = tr(subKey);
+            const applyLabel = imageEditMode === 'grid' && gridOperationMode === 'join' ? '输出拼接' : tr(labelKey);
+            applyBtn.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4"></i><span>${applyLabel}</span>`;
+        }
         if(imageEditMode === 'crop'){
             requestAnimationFrame(() => {
                 resetCropBox();
@@ -8729,7 +8906,7 @@ function setImageEditMode(mode, userTouched=false){
     }
     resizeEditDrawCanvas();
     if(imageEditMode === 'grid') refreshGridSplitPreview();
-    else if(imageEditMode === 'crop' || imageEditMode === 'outpaint' || prev === 'grid') clearEditDrawing(true);
+    else if(imageEditMode === 'crop' || imageEditMode === 'resize' || imageEditMode === 'outpaint' || prev === 'grid') clearEditDrawing(true);
     syncEditDrawingHistoryButtons();
     syncBrushToolButtons();
     syncTextToolState(true);
@@ -9215,7 +9392,7 @@ function refreshComparePanel(){
         return;
     }
     const onCurrentLoaded = () => {
-        rememberPreviewImageResolution();
+        if(currentImg.dataset.previewQuick !== '1') rememberPreviewImageResolution();
         syncPreviewFrameSize();
         updatePreviewMetaHint();
     };
@@ -9269,9 +9446,26 @@ function refreshComparePanel(){
         currentImg.src = fallback;
     };
     const previewSrc = displayMediaUrl(editing.image || curUrl);
-    if(currentImg.getAttribute('src') !== previewSrc) {
+    const quickPreviewSrc = smartMediaPreviewUrl(editing.image || curUrl, 1536);
+    const previewToken = `${editing.node?.id || ''}:${editing.index ?? 0}:${Date.now()}`;
+    currentImg.dataset.previewSrcToken = previewToken;
+    const loadFullPreview = () => {
+        if(imageEditMode !== 'preview' || !imageEditModal.classList.contains('open')) return;
+        if(currentImg.dataset.previewSrcToken !== previewToken) return;
+        currentImg.dataset.previewQuick = '';
+        if(currentImg.getAttribute('src') !== previewSrc) currentImg.src = previewSrc;
+    };
+    if(quickPreviewSrc && quickPreviewSrc !== previewSrc){
         currentImg.dataset.proxyFallbackTried = '';
+        currentImg.dataset.previewQuick = '1';
+        if(currentImg.getAttribute('src') !== quickPreviewSrc) currentImg.src = quickPreviewSrc;
+        requestAnimationFrame(() => setTimeout(loadFullPreview, 120));
+    } else if(currentImg.getAttribute('src') !== previewSrc) {
+        currentImg.dataset.proxyFallbackTried = '';
+        currentImg.dataset.previewQuick = '';
         currentImg.src = previewSrc;
+    } else {
+        currentImg.dataset.previewQuick = '';
     }
     if(currentImg.complete && currentImg.naturalWidth) requestAnimationFrame(onCurrentLoaded);
     const sources = previewCompareSources();
@@ -9990,6 +10184,55 @@ function syncGridCustomUndoBtn(){
     btn.disabled = gridCustomHistory.length === 0;
     btn.style.opacity = gridCustomHistory.length === 0 ? '0.4' : '1';
 }
+function clampImageResizeScale(value){
+    const num = Number(value);
+    if(!Number.isFinite(num)) return 0.5;
+    return Math.max(0.05, Math.min(1, Math.round(num * 100) / 100));
+}
+function imageResizeDimensions(){
+    const img = document.getElementById('cropImage');
+    const sourceW = Math.max(1, Math.round(Number(img?.naturalWidth || 0)));
+    const sourceH = Math.max(1, Math.round(Number(img?.naturalHeight || 0)));
+    const scale = clampImageResizeScale(imageResizeScale);
+    return {
+        sourceW,
+        sourceH,
+        scale,
+        targetW:Math.max(1, Math.round(sourceW * scale)),
+        targetH:Math.max(1, Math.round(sourceH * scale))
+    };
+}
+function syncImageResizeControls(){
+    imageResizeScale = clampImageResizeScale(imageResizeScale);
+    const range = document.getElementById('imageResizeScaleRange');
+    const input = document.getElementById('imageResizeScaleInput');
+    const label = document.getElementById('imageResizeResolution');
+    const overlay = document.getElementById('resizeResolutionOverlay');
+    const dims = imageResizeDimensions();
+    const text = `${dims.targetW}×${dims.targetH}`;
+    if(range && Number(range.value) !== dims.scale) range.value = String(dims.scale);
+    if(input && Number(input.value) !== dims.scale) input.value = String(dims.scale);
+    if(label) label.textContent = text;
+    if(overlay) overlay.textContent = text;
+}
+function setImageResizeScale(value){
+    imageResizeScale = clampImageResizeScale(value);
+    syncImageResizeControls();
+}
+async function resizedImageBlobFromEditor(){
+    const img = document.getElementById('cropImage');
+    if(!img?.naturalWidth || !img?.naturalHeight) return null;
+    const dims = imageResizeDimensions();
+    const canvasEl = document.createElement('canvas');
+    canvasEl.width = dims.targetW;
+    canvasEl.height = dims.targetH;
+    const ctx = canvasEl.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, 0, 0, dims.targetW, dims.targetH);
+    const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
+    return blob ? {blob, ...dims} : null;
+}
 function applyImageEditZoom(scaleOverride=null){
     ensureImageEditBaseSize();
     if(!imageEditBaseW) return;
@@ -10006,6 +10249,7 @@ function applyImageEditZoom(scaleOverride=null){
         clampCrop(); renderCropBox();
     }
     if(imageEditMode === 'grid') refreshGridSplitPreview();
+    syncImageResizeControls();
     syncImageEditOverflow(); updateZoomLabel();
 }
 function ensureImageEditBaseSize(force=false){
@@ -10391,7 +10635,7 @@ function openImageEditor(nodeId, imageIndex=0){
     cropState = {nodeId, imageIndex, x:0, y:0, w:0, h:0};
     gridCustomMode = false; gridCustomLines = []; gridCustomHistory = []; gridCustomDrag = null; gridCustomOrientation = 'h';
     gridOperationMode = 'split'; gridJoinLayout = null; gridJoinDrag = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridJoinGroupId = '';
-    imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageEditModeTouched = false;
+    imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageResizeScale = 0.5; imageEditModeTouched = false;
     cropAspectPreset = 'free'; cropAspectRatio = null; syncCropRatioButtons();
     editTextItems = []; editTextSelectedId = ''; editTextDrag = null; editTextDirty = false;
     const toggle = document.getElementById('gridCustomToggle');
@@ -10428,16 +10672,20 @@ function openImageEditor(nodeId, imageIndex=0){
         .filter(Boolean)
         .filter((u, i, arr) => u !== primaryEditorSrc && arr.indexOf(u) === i);
     let editorFallbackIndex = 0;
+    const editorSrcToken = `${nodeId}:${imageIndex}:${Date.now()}`;
+    img.dataset.editorSrcToken = editorSrcToken;
+    img.dataset.editorQuick = '';
     img.onload = () => {
         const targetImage = node.images?.[imageIndex];
         // 兜底用的是代理/缩放图，naturalWidth 不是原图真实尺寸，别污染节点的 natural_w/h。
-        if(editorFallbackIndex === 0 && targetImage && img.naturalWidth && img.naturalHeight && (!targetImage.natural_w || !targetImage.natural_h)){
+        const loadedPrimary = img.dataset.editorQuick !== '1' && img.getAttribute('src') === primaryEditorSrc;
+        if(loadedPrimary && editorFallbackIndex === 0 && targetImage && img.naturalWidth && img.naturalHeight && (!targetImage.natural_w || !targetImage.natural_h)){
             targetImage.natural_w = img.naturalWidth;
             targetImage.natural_h = img.naturalHeight;
             scheduleSave();
         }
         imageEditBaseW = img.clientWidth; imageEditBaseH = img.clientHeight;
-        updateZoomLabel(); resizeEditDrawCanvas(); resetEditDrawingHistory(); clearEditDrawing(true); resetCropBox();
+        updateZoomLabel(); syncImageResizeControls(); resizeEditDrawCanvas(); resetEditDrawingHistory(); clearEditDrawing(true); resetCropBox();
         if(!imageEditModeTouched) setImageEditMode('preview');
         else refreshComparePanel();
         if(!panoramaState.enabled) updatePreviewMetaHint();
@@ -10451,7 +10699,20 @@ function openImageEditor(nodeId, imageIndex=0){
     // 裁剪/涂抹等导出操作照常可用。而带 crossOrigin 会让浏览器对“缩略图已无 CORS 缓存的同源图”重新发起
     // CORS 请求并失败——表现就是预览先闪一下（命中缓存）随即变成破损图。
     img.removeAttribute('crossorigin');
-    img.src = primaryEditorSrc;
+    const quickEditorSrc = smartMediaPreviewUrl(image, 2048);
+    const loadFullEditorImage = () => {
+        if(!cropState || cropState.nodeId !== nodeId || cropState.imageIndex !== imageIndex) return;
+        if(!imageEditModal.classList.contains('open') || img.dataset.editorSrcToken !== editorSrcToken) return;
+        img.dataset.editorQuick = '';
+        if(img.getAttribute('src') !== primaryEditorSrc) img.src = primaryEditorSrc;
+    };
+    if(quickEditorSrc && quickEditorSrc !== primaryEditorSrc){
+        img.dataset.editorQuick = '1';
+        img.src = quickEditorSrc;
+        requestAnimationFrame(() => setTimeout(loadFullEditorImage, 120));
+    } else {
+        img.src = primaryEditorSrc;
+    }
     setImageEditMode('preview');
     updatePreviewNavButtons();
     refreshIcons();
@@ -10462,7 +10723,7 @@ function closeImageEditor(){
     document.querySelector('.image-edit-panel')?.classList.remove('video-preview-mode');
     const img = document.getElementById('cropImage');
     const previewVideo = document.getElementById('previewCurrentVideo');
-    img.onload = null; img.onerror = null; img.removeAttribute('src'); delete img.dataset.proxyFallbackTried; img.style.width = ''; img.style.height = ''; img.style.maxWidth = ''; img.style.maxHeight = '';
+    img.onload = null; img.onerror = null; img.removeAttribute('src'); delete img.dataset.proxyFallbackTried; delete img.dataset.editorSrcToken; delete img.dataset.editorQuick; img.style.width = ''; img.style.height = ''; img.style.maxWidth = ''; img.style.maxHeight = '';
     img.style.position = ''; img.style.left = ''; img.style.top = '';
     if(previewVideo){
         previewVideo.pause?.();
@@ -10475,13 +10736,13 @@ function closeImageEditor(){
     clearEditDrawing(true);
     cropState = null; cropDrag = null; editDrawState = null; resetEditDrawingHistory(); gridCustomDrag = null; gridJoinDrag = null; gridJoinLayout = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridOperationMode = 'split'; gridJoinGroupId = '';
     previewNavState = {nodeId:'', index:0, count:0};
-    imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageEditModeTouched = false;
+    imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageResizeScale = 0.5; imageEditModeTouched = false;
     cropAspectPreset = 'free'; cropAspectRatio = null; syncCropRatioButtons();
     disposePanoramaPreview();
     previewPanDrag = null; previewCompareDrag = false; imageEditPanDrag = null; resetPreviewTransform();
     document.getElementById('imageEditStage')?.classList.remove('overflow-x', 'overflow-y', 'preview-mode');
     const cropCanvasEl = document.getElementById('cropCanvas');
-    cropCanvasEl?.classList.remove('grid-custom-h', 'grid-custom-v', 'outpaint-mode', 'outpaint-warning', 'dragging-image', 'text-mode');
+    cropCanvasEl?.classList.remove('grid-custom-h', 'grid-custom-v', 'outpaint-mode', 'outpaint-warning', 'dragging-image', 'text-mode', 'resize-mode');
     cropCanvasEl?.classList.remove('grid-join-mode');
     document.getElementById('cropImage')?.classList.remove('grid-join-hidden');
     const joinCanvas = document.getElementById('gridJoinCanvas');
@@ -10612,10 +10873,10 @@ async function uploadImageBlobs(blobs){
     const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
     return data.files || [];
 }
-function replaceEditedImage(file){
+function replaceEditedImage(file, extra={}){
     const {node, index} = currentEditImage();
     if(!node || !file) return false;
-    node.images[index] = {...(node.images[index] || {}), url:file.url, name:file.name, kind:file.kind || mediaKindForItem(file), natural_w:0, natural_h:0};
+    node.images[index] = {...(node.images[index] || {}), url:file.url, name:file.name, kind:file.kind || mediaKindForItem(file), natural_w:0, natural_h:0, ...extra};
     if((node.images || []).length === 1){ delete node.w; delete node.h; }
     selectedId = node.id; selectedImage = {nodeId:node.id, index};
     return true;
@@ -10838,11 +11099,35 @@ async function applyImageGridJoin(){
         toast('已输出拼接图片');
     }
 }
+async function applyImageResize(){
+    if(!cropState) return;
+    const {node, image} = currentEditImage();
+    if(!node || !image) return;
+    let resized = null;
+    try {
+        resized = await resizedImageBlobFromEditor();
+    } catch(err) {
+        toast('缩放失败：当前图片无法写入画布，请换成本地图片或重新上传后再试');
+        return;
+    }
+    if(!resized?.blob) return;
+    const base = safeExportFileName((downloadNameForMediaItem(image, 'image') || image.name || 'image').replace(/\.[^.]+$/, ''), 'image');
+    const suffix = `${Math.round(resized.scale * 100)}pct`;
+    const file = await uploadCroppedBlob(resized.blob, `${base}_resize_${suffix}.png`);
+    if(!file) return;
+    if(!replaceEditedImage(file, {kind:'image', role:image.role || '', natural_w:resized.targetW, natural_h:resized.targetH})){
+        return;
+    }
+    closeImageEditor();
+    render();
+    scheduleSave();
+}
 function applyImageEdit(){
     if(imageEditMode === 'preview') return;
     if(imageEditMode === 'outpaint') return applyImageOutpaint();
     if(imageEditMode === 'mask') return applyImageMask();
     if(imageEditMode === 'brush') return applyImageBrush();
+    if(imageEditMode === 'resize') return applyImageResize();
     if(imageEditMode === 'grid') return applyImageGridSplit();
     return applyImageCrop();
 }
@@ -16371,6 +16656,9 @@ document.getElementById('editTextCanvas')?.addEventListener('dblclick', event =>
         syncGridGapValue();
         refreshGridSplitPreview();
     });
+});
+['imageResizeScaleRange','imageResizeScaleInput'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', event => setImageResizeScale(event.target.value));
 });
 document.querySelectorAll('[data-panorama-ratio]').forEach(btn => {
     btn.addEventListener('click', event => {

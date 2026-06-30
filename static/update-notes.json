@@ -1,22 +1,26 @@
 {
   "version": "2026.06.29",
-  "updated_at": "2026-06-29T21:05:00+08:00",
+  "updated_at": "2026-06-30T20:36:36+08:00",
   "items": [
     {
-      "type": "improve",
-      "text": "新增节点排序功能"
+      "type": "feature",
+      "text": "新增 OpenAI Codex CLI 平台"
     },
     {
-      "type": "improve",
-      "text": "优化裁剪功能"
+      "type": "feature",
+      "text": "图片编辑新增缩放原图"
     },
     {
-      "type": "improve",
-      "text": "修复日志无法复制信息的bug"
+      "type": "feature",
+      "text": "Alt 复制支持保留连线"
     },
     {
-      "type": "improve",
-      "text": "修复Safari兼容问题"
+      "type": "update",
+      "text": "图片节点标题可显示改名"
+    },
+    {
+      "type": "feature",
+      "text": "生成完成新增提示音"
     }
   ]
 }

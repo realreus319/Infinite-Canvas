@@ -263,7 +263,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng", "codex"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -299,6 +299,12 @@ JIMENG_DEFAULT_VIDEO_MODELS = [
     "3.0",
     "3.0fast",
 ]
+CODEX_DEFAULT_IMAGE_MODELS = ["$imagegen"]
+CODEX_DEFAULT_CHAT_MODELS = ["gpt-5.5"]
+try:
+    CODEX_DEFAULT_TIMEOUT = max(30, min(3600, int(os.getenv("CODEX_CLI_TIMEOUT", "900"))))
+except Exception:
+    CODEX_DEFAULT_TIMEOUT = 900
 AGNES_DEFAULT_VIDEO_MODELS = ["agnes-video-v2.0"]
 JIMENG_LEGACY_IMAGE_MODELS = {
     "jimeng-image-2k",
@@ -771,6 +777,22 @@ def default_api_providers():
             "ms_loras": [],
             "ms_defaults_version": 0,
         },
+        {
+            "id": "codex",
+            "name": "OpenAI CLI",
+            "base_url": "",
+            "protocol": "codex",
+            "image_request_mode": "openai",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
+            "enabled": True,
+            "primary": False,
+            "image_models": CODEX_DEFAULT_IMAGE_MODELS,
+            "chat_models": CODEX_DEFAULT_CHAT_MODELS,
+            "video_models": [],
+            "ms_loras": [],
+            "ms_defaults_version": 0,
+        },
     ]
 
 def merge_default_api_providers(providers):
@@ -849,6 +871,17 @@ def merge_default_api_providers(providers):
             protocols = normalize_model_protocols(current.get("model_protocols"))
             protocols.update(normalize_model_protocols(lingjing_default.get("model_protocols")))
             current["model_protocols"] = protocols
+    codex_default = next((d for d in default_api_providers() if d["id"] == "codex"), None)
+    if codex_default:
+        current = next((item for item in merged if item.get("id") == "codex"), None)
+        if not current:
+            merged.append(codex_default)
+        else:
+            current["protocol"] = "codex"
+            current["base_url"] = ""
+            current["image_models"] = model_list_from_values([*(current.get("image_models") or []), *CODEX_DEFAULT_IMAGE_MODELS])
+            current["chat_models"] = model_list_from_values([*(current.get("chat_models") or []), *CODEX_DEFAULT_CHAT_MODELS])
+            current["video_models"] = []
     # 即梦 CLI 不再是强制保留的默认平台：仅在用户已添加了即梦协议的平台时，规范化其默认模型/地址。
     for current in merged:
         if not is_jimeng_provider(current):
@@ -1166,6 +1199,9 @@ def normalize_provider(item):
         volc_region = volc_region or VOLCENGINE_DEFAULT_REGION
     if provider_id == "jimeng":
         protocol = "jimeng"
+        base_url = ""
+    if provider_id == "codex":
+        protocol = "codex"
         base_url = ""
     if provider_id == "runninghub":
         protocol = "runninghub"
@@ -2436,6 +2472,9 @@ class RunningHubUploadAssetRequest(BaseModel):
 class JimengHelpRequest(BaseModel):
     command: str = ""
 
+class CodexHelpRequest(BaseModel):
+    command: str = ""
+
 class JimengQueryMediaRequest(BaseModel):
     submit_id: str = ""
     kind: str = "image"
@@ -3404,6 +3443,8 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
         mdl = selected_model(ms_model or model, MODELSCOPE_CHAT_MODELS[0] if MODELSCOPE_CHAT_MODELS else "MiniMax/MiniMax-M2.7")
         return base, hdrs, mdl
     api_provider = get_api_provider(provider or "")
+    if is_codex_provider(api_provider):
+        raise HTTPException(status_code=400, detail="OpenAI CLI 使用本机 codex 登录态，不需要 API Key。请使用画布/聊天里的 OpenAI CLI 专用通道。")
     base_root = (api_provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_root:
         raise HTTPException(status_code=400, detail=f"{api_provider.get('name') or api_provider['id']} 未配置 Base URL")
@@ -3454,8 +3495,9 @@ def log_net_error(context, exc, url=""):
 
 def api_headers(json_body=True, provider=None, model=""):
     if provider:
-        key_env = provider_key_env(provider["id"])
-        api_key = os.getenv(key_env, "")
+        if is_codex_provider(provider):
+            raise HTTPException(status_code=400, detail="OpenAI CLI 使用本机 codex 登录态，不需要 API Key。当前入口应走 Codex CLI 专用通道。")
+        api_key = provider_env_key_value(provider["id"])
         provider_name = provider.get("name") or provider["id"]
         if not api_key:
             raise HTTPException(status_code=400, detail=f"未配置 {provider_name} 的 API Key，请在 API 平台管理中填写。")
@@ -3779,7 +3821,7 @@ def provider_protocol(provider):
 # 单模型可覆盖的协议（仅 OpenAI / Gemini，二者可共用同一站点的 Base URL + Key）
 PER_MODEL_PROTOCOL_OPTIONS = {"openai", "gemini"}
 # 协议固定、不支持单模型覆盖的内置平台
-FIXED_PROTOCOL_PROVIDER_IDS = {"modelscope", "volcengine", "jimeng", "runninghub"}
+FIXED_PROTOCOL_PROVIDER_IDS = {"modelscope", "volcengine", "jimeng", "runninghub", "codex"}
 
 def normalize_model_protocols(value):
     """规整 {模型名: 协议} 覆盖表，仅保留 openai/gemini。"""
@@ -3835,6 +3877,280 @@ def is_runninghub_provider(provider):
 
 def is_jimeng_provider(provider):
     return provider_protocol(provider) == "jimeng" or str((provider or {}).get("id") or "").strip().lower() == "jimeng"
+
+def is_codex_provider(provider):
+    return provider_protocol(provider) == "codex" or str((provider or {}).get("id") or "").strip().lower() == "codex"
+
+def codex_env_value(key):
+    return os.getenv(key, "") or read_api_env_value(key)
+
+def codex_cli_executable():
+    configured = str(codex_env_value("CODEX_BIN") or "").strip()
+    if configured:
+        return configured
+    return shutil.which("codex") or shutil.which("codex.exe") or shutil.which("codex.cmd") or ""
+
+def codex_timeout(default=CODEX_DEFAULT_TIMEOUT):
+    try:
+        return max(30, min(3600, int(os.getenv("CODEX_CLI_TIMEOUT", str(default)) or default)))
+    except Exception:
+        return default
+
+def codex_model_for_exec(model="", fallback=""):
+    value = str(model or fallback or "").strip()
+    low = value.lower()
+    if not value or low.startswith("$imagegen") or low.startswith("gpt-image"):
+        return ""
+    return value
+
+def codex_decode_output(stdout, stderr):
+    out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
+    err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+    return out_text, err_text
+
+async def run_codex_cli(prompt, model="", image_paths=None, timeout=None, output_last_message=True):
+    exe = codex_cli_executable()
+    if not exe:
+        raise HTTPException(status_code=400, detail="未找到 OpenAI Codex CLI。请先运行 CLI/windows/openai/install_openai_codex_cli.bat，并完成 codex 登录。")
+    image_paths = [str(path) for path in (image_paths or []) if path and os.path.isfile(str(path))]
+    last_path = ""
+    args = [
+        exe,
+        "exec",
+        "--cd",
+        BASE_DIR,
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+    ]
+    exec_model = codex_model_for_exec(model)
+    if exec_model:
+        args.extend(["--model", exec_model])
+    for path in image_paths:
+        args.extend(["--image", path])
+    if output_last_message:
+        fd, last_path = tempfile.mkstemp(prefix="codex_last_", suffix=".txt", dir=OUTPUT_OUTPUT_DIR)
+        os.close(fd)
+        args.extend(["--output-last-message", last_path])
+    args.append("-")
+    prompt_bytes = str(prompt or "").encode("utf-8")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=BASE_DIR,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=prompt_bytes), timeout=timeout or codex_timeout())
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="OpenAI Codex CLI 执行超时。可设置 CODEX_CLI_TIMEOUT 增大等待时间。") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=f"未找到 OpenAI Codex CLI：{exe}") from exc
+    out_text, err_text = codex_decode_output(stdout, stderr)
+    last_text = ""
+    if last_path and os.path.exists(last_path):
+        try:
+            with open(last_path, "r", encoding="utf-8-sig") as f:
+                last_text = f.read().strip()
+        except Exception:
+            last_text = ""
+        try:
+            os.remove(last_path)
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        message = err_text or out_text or last_text or f"exit={proc.returncode}"
+        raise HTTPException(status_code=502, detail=f"OpenAI Codex CLI 调用失败：{message[:1200]}")
+    return {"text": last_text or out_text, "_stdout": out_text, "_stderr": err_text}
+
+def codex_output_image_files(since_time=0):
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    root = os.path.abspath(OUTPUT_OUTPUT_DIR)
+    files = []
+    try:
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in exts:
+                continue
+            mtime = os.path.getmtime(path)
+            if mtime + 1 < float(since_time or 0):
+                continue
+            files.append((mtime, path))
+    except Exception:
+        return []
+    return [path for _mtime, path in sorted(files, reverse=True)]
+
+def codex_output_url_from_path(path):
+    path = os.path.abspath(str(path or ""))
+    root = os.path.abspath(OUTPUT_OUTPUT_DIR)
+    try:
+        if os.path.commonpath([root, path]) == root:
+            return output_url_for(os.path.basename(path), "output")
+    except Exception:
+        return ""
+    return ""
+
+async def codex_prepare_local_media(ref_url):
+    text = str(ref_url or "").strip()
+    if not text:
+        return "", []
+    if text.startswith(("/output/", "/assets/")):
+        path = output_file_from_url(text)
+        if path:
+            return path, []
+        raise HTTPException(status_code=404, detail=f"OpenAI CLI 参考素材不存在：{text}")
+    if text.startswith("file://"):
+        path = urllib.parse.unquote(urllib.parse.urlparse(text).path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", path):
+            path = path[1:]
+        if os.path.isfile(path):
+            return path, []
+    if os.path.isfile(text):
+        return text, []
+    temp_paths = []
+    suffix = ".png"
+    if text.startswith("data:"):
+        if ";base64," not in text:
+            raise HTTPException(status_code=400, detail="OpenAI CLI 参考素材 data URL 缺少 base64 数据")
+        header, encoded = text.split(";base64,", 1)
+        mime = header.split(":", 1)[1].split(";", 1)[0] if ":" in header else ""
+        suffix = mimetypes.guess_extension(mime) or suffix
+        fd, path = tempfile.mkstemp(prefix="codex_ref_", suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(base64.b64decode(encoded))
+        temp_paths.append(path)
+        return path, temp_paths
+    if text.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0), follow_redirects=True) as client:
+            response = await client.get(text)
+            response.raise_for_status()
+            clean_path = urllib.parse.urlparse(text).path
+            suffix = os.path.splitext(clean_path)[1] or mimetypes.guess_extension(response.headers.get("content-type", "")) or suffix
+            fd, path = tempfile.mkstemp(prefix="codex_ref_", suffix=suffix)
+            with os.fdopen(fd, "wb") as f:
+                f.write(response.content)
+            temp_paths.append(path)
+            return path, temp_paths
+    raise HTTPException(status_code=400, detail=f"OpenAI CLI 无法读取参考素材：{text[:120]}")
+
+async def codex_reference_paths(reference_images=None):
+    paths = []
+    temp_paths = []
+    try:
+        for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
+            url = ref.get("url") if isinstance(ref, dict) else getattr(ref, "url", "")
+            if not url:
+                continue
+            path, created = await codex_prepare_local_media(url)
+            if path:
+                paths.append(path)
+            temp_paths.extend(created)
+        return paths, temp_paths
+    except Exception:
+        for path in temp_paths:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        raise
+
+def codex_models_payload(raw=None):
+    all_models = [*CODEX_DEFAULT_IMAGE_MODELS, *CODEX_DEFAULT_CHAT_MODELS]
+    return {
+        "ok": True,
+        "protocol": "codex",
+        "status": 200,
+        "message": "OpenAI Codex CLI 可用，模型列表来自本机 CLI 默认配置。",
+        "model_count": len(all_models),
+        "total": len(all_models),
+        "image_models": CODEX_DEFAULT_IMAGE_MODELS,
+        "chat_models": CODEX_DEFAULT_CHAT_MODELS,
+        "video_models": [],
+        "all": all_models,
+        "raw": raw or {},
+    }
+
+async def generate_codex_provider_image(prompt, size, model, reference_images=None, provider=None):
+    ref_paths, temp_paths = await codex_reference_paths(reference_images)
+    since = time.time()
+    try:
+        image_prompt = (
+            "$imagegen\n\n"
+            f"任务：{prompt}\n\n"
+            f"尺寸/比例参考：{size or 'auto'}。\n"
+            f"请生成或编辑图片，并把最终图片文件保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
+            "只需要输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。"
+        )
+        raw = await run_codex_cli(image_prompt, model="", image_paths=ref_paths, timeout=codex_timeout(), output_last_message=True)
+        files = codex_output_image_files(since)
+        urls = []
+        for path in files:
+            url = codex_output_url_from_path(path)
+            if url and url not in urls:
+                urls.append(url)
+        if not urls:
+            text = f"{raw.get('text') or raw.get('_stdout') or ''}\n{raw.get('_stderr') or ''}"
+            pattern = r"([A-Za-z]:\\[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif)|/[^\r\n\"'<>]+\.(?:png|jpe?g|webp|gif))"
+            for match in re.findall(pattern, text, flags=re.I):
+                url = codex_output_url_from_path(match.strip())
+                if url and url not in urls:
+                    urls.append(url)
+        if not urls:
+            status_text = (raw.get("text") or raw.get("_stdout") or raw.get("_stderr") or "")[:1200]
+            raise HTTPException(status_code=502, detail=f"OpenAI CLI 已返回，但没有在输出目录发现图片：{status_text}")
+        return {"type": "url", "value": urls[0]}, {"images": urls, "text": raw.get("text"), "provider": "codex"}
+    finally:
+        for path in temp_paths:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+def codex_chat_prompt(payload, history_messages=None):
+    parts = []
+    system_prompt = str(getattr(payload, "system_prompt", "") or "").strip()
+    if system_prompt:
+        parts.append(f"系统要求：\n{system_prompt}")
+    for item in (history_messages or [])[-MAX_HISTORY_MESSAGES:]:
+        role = str(item.get("role") or "").strip()
+        content = item.get("content")
+        if role in {"user", "assistant"} and content:
+            label = "用户" if role == "user" else "助手"
+            parts.append(f"{label}：\n{content}")
+    message = str(getattr(payload, "message", "") or "").strip()
+    parts.append(f"用户：\n{message}")
+    parts.append("请直接回答用户，输出纯文本，不要修改项目文件。")
+    return "\n\n".join(part for part in parts if part).strip()
+
+async def codex_chat_text(payload, history_messages=None):
+    image_paths = []
+    temp_paths = []
+    try:
+        image_values = []
+        if hasattr(payload, "images"):
+            image_values.extend([{"url": item} for item in (getattr(payload, "images", None) or []) if item])
+        if hasattr(payload, "reference_images"):
+            image_values.extend([ref.dict() for ref in (getattr(payload, "reference_images", None) or []) if getattr(ref, "url", "")])
+        image_paths, temp_paths = await codex_reference_paths(image_values)
+        raw = await run_codex_cli(
+            codex_chat_prompt(payload, history_messages),
+            model=getattr(payload, "model", "") or CODEX_DEFAULT_CHAT_MODELS[0],
+            image_paths=image_paths,
+            timeout=codex_timeout(),
+            output_last_message=True,
+        )
+        text = str(raw.get("text") or "").strip()
+        return text or "Codex CLI 返回了空回复。", raw
+    finally:
+        for path in temp_paths:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 def is_yuli_provider(provider):
     # 玉玉API（yuli.host）的视频接口走自有格式（/v1/video/create + /v1/video/query），
@@ -8629,6 +8945,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
+    if is_codex_provider(provider):
+        return await generate_codex_provider_image(prompt, size, model, reference_images, provider)
     if is_jimeng_provider(provider):
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
@@ -8920,6 +9238,10 @@ def parse_agent_decision(raw_text, message, refs, has_previous_image):
 async def decide_chat_agent_action(payload, conversation, refs):
     has_previous_image = bool(latest_chat_image_refs(conversation, 1))
     fallback = heuristic_agent_decision(payload.message, refs, has_previous_image)
+    provider_cfg = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}
+    if is_codex_provider(provider_cfg):
+        fallback["router_model"] = selected_model(payload.model, (provider_cfg.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+        return fallback
     chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     history = conversation["messages"][-MAX_HISTORY_MESSAGES:]
     custom_system_prompt = str(getattr(payload, "system_prompt", "") or "").strip()
@@ -8948,7 +9270,6 @@ async def decide_chat_agent_action(payload, conversation, refs):
         )
     })
     try:
-        provider_cfg = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}
         async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
             req_body = {"model": model, "messages": upstream_messages}
             if is_apimart_provider(provider_cfg):
@@ -8969,8 +9290,21 @@ async def decide_chat_agent_action(payload, conversation, refs):
         return fallback
 
 async def build_chat_text_reply(payload, conversation):
-    chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     provider_cfg = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}
+    if is_codex_provider(provider_cfg):
+        model = selected_model(payload.model, (provider_cfg.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+        payload.model = model
+        text, raw = await codex_chat_text(payload, conversation["messages"][-MAX_HISTORY_MESSAGES:])
+        return {
+            "id": uuid.uuid4().hex,
+            "role": "assistant",
+            "content": text,
+            "created_at": now_ms(),
+            "model": model,
+            "raw_usage": None,
+            "raw": raw,
+        }
+    chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     is_apimart = is_apimart_provider(provider_cfg)
     upstream_messages = [{"role": "system", "content": chat_system_prompt(payload)}]
     for item in conversation["messages"][-MAX_HISTORY_MESSAGES:]:
@@ -10155,6 +10489,67 @@ async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
         return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
     raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
 
+@app.get("/api/codex/status")
+async def codex_status():
+    exe = codex_cli_executable()
+    if not exe:
+        return {
+            "installed": False,
+            "logged_in": False,
+            "message": "未找到 OpenAI Codex CLI，请先安装。",
+        }
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe,
+            "--version",
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        out_text, err_text = codex_decode_output(stdout, stderr)
+        ok = proc.returncode == 0
+        return {
+            "installed": ok,
+            "logged_in": None,
+            "version": out_text or err_text,
+            "path": exe,
+            "message": "OpenAI Codex CLI 已安装。登录状态会在首次执行 codex exec 时由 CLI 校验。" if ok else (err_text or out_text or "Codex CLI 检测失败"),
+            "raw": {"stdout": out_text, "stderr": err_text, "returncode": proc.returncode},
+        }
+    except Exception as exc:
+        return {
+            "installed": False,
+            "logged_in": False,
+            "path": exe,
+            "message": f"Codex CLI 检测失败：{exc}",
+        }
+
+@app.post("/api/codex/help")
+async def codex_help(payload: CodexHelpRequest):
+    exe = codex_cli_executable()
+    if not exe:
+        raise HTTPException(status_code=400, detail="未找到 OpenAI Codex CLI。")
+    allowed = {"", "exec", "login", "logout", "doctor", "mcp", "app", "update"}
+    command = str(payload.command or "").strip()
+    if command not in allowed:
+        raise HTTPException(status_code=400, detail="不允许的 Codex CLI 命令")
+    args = [exe]
+    if command:
+        args.append(command)
+    args.append("--help")
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=BASE_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+    out_text, err_text = codex_decode_output(stdout, stderr)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=502, detail=(err_text or out_text or f"exit={proc.returncode}")[:1000])
+    return {"text": out_text or err_text, "raw": {"stdout": out_text, "stderr": err_text}}
+
 @app.get("/api/jimeng/status")
 async def jimeng_status():
     exe = jimeng_cli_executable()
@@ -10416,6 +10811,8 @@ def protocol_from_payload(payload):
         return "runninghub"
     if provider_id == "jimeng":
         return "jimeng"
+    if provider_id == "codex":
+        return "codex"
     base_url = str(getattr(payload, "base_url", "") or "").strip().lower()
     if "runninghub.cn" in base_url or "runninghub.ai" in base_url:
         return "runninghub"
@@ -10433,7 +10830,7 @@ def api_key_from_payload(payload, protocol: str = ""):
             value = os.getenv(runninghub_wallet_key_env(), "")
             if value:
                 return value
-        value = os.getenv(provider_key_env(provider_id), "")
+        value = provider_env_key_value(provider_id)
         if value:
             return value
     if protocol == "volcengine":
@@ -10631,6 +11028,15 @@ def apply_agnes_model_defaults(base_url, grouped, ids):
 async def test_provider_connection(payload: TestConnectionPayload):
     """测试请求地址是否可用：调上游 /v1/models。验证通过时同时把模型清单按类别返回，避免再调一次拉取接口。"""
     protocol = protocol_from_payload(payload)
+    if protocol == "codex":
+        status = await codex_status()
+        payload_models = codex_models_payload(raw={"status": status})
+        payload_models.update({
+            "ok": bool(status.get("installed")),
+            "status": 200 if status.get("installed") else 0,
+            "message": status.get("message") or ("OpenAI Codex CLI 可用" if status.get("installed") else "未找到 OpenAI Codex CLI"),
+        })
+        return payload_models
     if protocol == "jimeng":
         status = await jimeng_status()
         return {
@@ -10726,9 +11132,18 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
     """验证异步协议：用假 task_id 请求 GET /v1/tasks/{fake_id}。
     收到 400 Invalid task ID = 端点存在且 Key 有效；401/403 = Key 无效；404/连接失败 = 不支持异步端点。"""
     base_url = (payload.base_url or "").strip().rstrip("/")
+    protocol = protocol_from_payload(payload)
+    if protocol == "codex":
+        status = await codex_status()
+        return {
+            "ok": bool(status.get("installed")),
+            "protocol": "codex",
+            "status_code": 200 if status.get("installed") else 0,
+            "message": status.get("message") or "OpenAI Codex CLI 本机检测完成",
+            "raw": status,
+        }
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
-    protocol = protocol_from_payload(payload)
     api_key = api_key_from_payload(payload, protocol)
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
@@ -10852,6 +11267,11 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
 async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str = "openai", image_request_mode: str = "openai"):
     """从上游模型列表端点拉取模型，并按名称做轻量分类。"""
     protocol = protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
+    if protocol == "codex":
+        status = await codex_status()
+        payload = codex_models_payload(raw={"status": status})
+        payload["message"] = status.get("message") or payload["message"]
+        return payload
     if protocol == "jimeng":
         return {
             "total": len(JIMENG_DEFAULT_IMAGE_MODELS) + len(JIMENG_DEFAULT_VIDEO_MODELS),
@@ -10979,9 +11399,11 @@ async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
 async def fetch_upstream_models(provider_id: str):
     """从已保存的上游 OpenAI 兼容接口拉取 /v1/models 列表，按名称智能分类为 image/chat/video。"""
     provider = get_api_provider_exact(provider_id)
+    if is_codex_provider(provider):
+        return await fetch_models_from_upstream("", "", "codex", provider.get("image_request_mode") or "openai")
     api_key = os.getenv(runninghub_wallet_key_env(), "") if provider["id"] == "runninghub" else ""
     if not api_key:
-        api_key = os.getenv(provider_key_env(provider["id"]), "")
+        api_key = provider_env_key_value(provider["id"])
     if not api_key:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
     return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider), provider.get("image_request_mode") or "openai")
@@ -11764,7 +12186,7 @@ async def canvas_video(payload: CanvasVideoRequest):
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
-    api_key = os.getenv(provider_key_env(provider["id"]), "")
+    api_key = provider_env_key_value(provider["id"])
     if not api_key:
         raise HTTPException(status_code=400, detail=f"未配置 {provider.get('name') or provider['id']} 的 API Key，请在 API 设置中填写。")
     is_apimart = is_apimart_provider(provider)
@@ -12200,6 +12622,12 @@ async def canvas_video(payload: CanvasVideoRequest):
 
 @app.post("/api/canvas-llm")
 async def canvas_llm(payload: CanvasLLMRequest):
+    _provider = get_api_provider(payload.provider)
+    if is_codex_provider(_provider):
+        model = selected_model(payload.model, (_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+        payload.model = model
+        text, raw = await codex_chat_text(payload, payload.messages)
+        return {"text": text, "model": model, "raw_usage": None, "raw": raw}
     chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     # 判断协议：APIMart 异步 vs 标准 OpenAI
     _llm_provider = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}
@@ -13179,8 +13607,18 @@ async def import_shared_folder_files(payload: SharedFolderImport):
     return {"library": lib, "items": added}
 
 async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_model=""):
-    chat_base, chat_hdrs, resolved_model = resolve_chat_provider(provider_id, model, ms_model)
     llm_provider = get_api_provider(provider_id) if provider_id not in ("modelscope",) else {}
+    if is_codex_provider(llm_provider):
+        resolved_model = selected_model(model, (llm_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+        payload = CanvasLLMRequest(
+            message=(prompt or "描述图片").strip() or "描述图片",
+            provider=provider_id or "codex",
+            model=resolved_model,
+            images=[abs_path],
+        )
+        text, _raw = await codex_chat_text(payload, [])
+        return text, resolved_model
+    chat_base, chat_hdrs, resolved_model = resolve_chat_provider(provider_id, model, ms_model)
     is_apimart = is_apimart_provider(llm_provider)
     prompt_text = (prompt or "描述图片").strip() or "描述图片"
     data_url = image_path_to_data_url(abs_path, max_size=1024)
@@ -13594,6 +14032,24 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
             "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
         }
     else:
+        _codex_provider = get_api_provider(payload.provider)
+        if is_codex_provider(_codex_provider):
+            model = selected_model(payload.model, (_codex_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+            payload.model = model
+            text, raw = await codex_chat_text(payload, conversation["messages"][-MAX_HISTORY_MESSAGES:])
+            assistant_message = {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": text,
+                "created_at": now_ms(),
+                "model": model,
+                "raw_usage": None,
+                "raw": raw,
+            }
+            conversation["messages"].append(assistant_message)
+            conversation["updated_at"] = now_ms()
+            save_conversation(user_id, conversation)
+            return {"conversation": conversation, "message": assistant_message}
         chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
         _conv_provider = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}
         _conv_is_apimart = is_apimart_provider(_conv_provider)
@@ -13748,6 +14204,35 @@ async def chat_stream(payload: ChatRequest, request: Request, x_user_id: str = H
     conversation["messages"].append(user_message)
     conversation["updated_at"] = now_ms()
     save_conversation(user_id, conversation)
+
+    _codex_provider = get_api_provider(payload.provider)
+    if is_codex_provider(_codex_provider):
+        model = selected_model(payload.model, (_codex_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
+        payload.model = model
+
+        async def codex_stream():
+            yield sse_event({"type": "meta", "conversation": conversation})
+            try:
+                text, raw = await codex_chat_text(payload, conversation["messages"][-MAX_HISTORY_MESSAGES:])
+            except HTTPException as exc:
+                yield sse_event({"type": "error", "detail": exc.detail})
+                return
+            assistant_message = {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": text,
+                "created_at": now_ms(),
+                "model": model,
+                "raw_usage": None,
+                "raw": raw,
+            }
+            conversation["messages"].append(assistant_message)
+            conversation["updated_at"] = now_ms()
+            save_conversation(user_id, conversation)
+            yield sse_event({"type": "delta", "delta": text})
+            yield sse_event({"type": "done", "conversation": conversation, "message": assistant_message})
+
+        return StreamingResponse(codex_stream(), media_type="text/event-stream")
 
     chat_base, chat_hdrs, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     _stream_provider = get_api_provider(payload.provider) if payload.provider not in ("modelscope",) else {}

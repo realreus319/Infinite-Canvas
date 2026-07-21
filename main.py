@@ -348,10 +348,7 @@ JIMENG_DEFAULT_VIDEO_MODELS = [
     "seedance2.0fast_vip",
     "seedance2.0",
     "seedance2.0fast",
-    "3.5pro",
-    "3.0pro",
-    "3.0",
-    "3.0fast",
+    "seedance2.0mini",
 ]
 CODEX_DEFAULT_IMAGE_MODELS = ["gpt-image-2"]
 CODEX_DEFAULT_CHAT_MODELS = ["gpt-5.5"]
@@ -5744,18 +5741,36 @@ def jimeng_image_resolution(model, size, mode="text2image"):
     # 4.x/5.0 只支持 2k/4k
     return "4k" if desired == "4k" else "2k"
 
-# 仅 VIP seedance 支持 1080P；其余模型最高 720P（官方无 480P 选项）
-JIMENG_VIDEO_1080P_MODELS = {"seedance2.0_vip", "seedance2.0fast_vip"}
+# 当前 dreamina CLI 接受小写分辨率值；只有 seedance2.0_vip 支持 1080p/4k，
+# 其余视频模型最高 720p。CLI 省略该参数时可能提交非法 video_resolution_type，
+# 因此“自动”模式显式使用 720p。
+JIMENG_VIDEO_HIGH_RES_MODELS = {"seedance2.0_vip"}
+JIMENG_VIDEO_MODEL_VERSIONS = {
+    "seedance1.5pro",
+    "seedance2.0",
+    "seedance2.0fast",
+    "seedance2.0_vip",
+    "seedance2.0fast_vip",
+    "seedance2.0mini",
+}
 
 def jimeng_video_resolution(model, resolution):
+    if not str(resolution or "").strip():
+        return "720p"
     version = jimeng_video_model_version(model)
     requested = str(resolution or "").strip().upper()
-    if requested not in {"480P", "720P", "1080P"}:
+    if requested in {"4K", "4KP"}:
+        requested = "4k"
+    elif requested in {"1080P", "1080"}:
+        requested = "1080p"
+    elif requested in {"720P", "720"}:
+        requested = "720p"
+    else:
         text = str(model or "").lower()
-        requested = "1080P" if "1080" in text else "720P"
-    if requested == "1080P" and version in JIMENG_VIDEO_1080P_MODELS:
-        return "1080P"
-    return "720P"
+        requested = "1080p" if "1080" in text else "720p"
+    if version not in JIMENG_VIDEO_HIGH_RES_MODELS:
+        return "720p"
+    return requested if requested in {"720p", "1080p", "4k"} else "720p"
 
 # 各模型支持的时长区间（秒）：3.0 系列 3-10，3.5pro 4-12，seedance 4-15
 def jimeng_video_duration_range(model):
@@ -5788,25 +5803,19 @@ def jimeng_video_model_version(model):
     value = str(model or "").strip()
     low = value.lower()
     aliases = {
+        "seedance1.5pro": "seedance1.5pro",
         "seedance2.0fast_vip": "seedance2.0fast_vip",
         "seedance2.0_vip": "seedance2.0_vip",
         "seedance2.0fast": "seedance2.0fast",
         "seedance2.0": "seedance2.0",
-        "3.0_fast": "3.0fast",
-        "3.0fast": "3.0fast",
-        "3.0_pro": "3.0pro",
-        "3.0pro": "3.0pro",
-        "3.5_pro": "3.5pro",
-        "3.5pro": "3.5pro",
-        "3.0": "3.0",
     }
     for key, mapped in aliases.items():
         if key in low:
-            return mapped
+            return mapped if mapped in JIMENG_VIDEO_MODEL_VERSIONS else ""
     return ""
 
 def jimeng_video_resolution_arg(model, resolution):
-    return jimeng_video_resolution(model, resolution).lower()
+    return jimeng_video_resolution(model, resolution)
 
 def jimeng_video_ratio_arg(aspect_ratio):
     value = str(aspect_ratio or "").strip()
@@ -5819,8 +5828,9 @@ def jimeng_append_model_resolution_args(args, payload: CanvasVideoRequest, inclu
     model_version = jimeng_video_model_version(payload.model)
     if include_model and model_version:
         args.append(f"--model_version={model_version}")
-    if payload.resolution:
-        args.append(f"--video_resolution={jimeng_video_resolution_arg(payload.model, payload.resolution)}")
+    resolution = jimeng_video_resolution_arg(payload.model, payload.resolution)
+    if resolution:
+        args.append(f"--video_resolution={resolution}")
 
 def jimeng_video_ref_role(ref):
     role = getattr(ref, "role", "")
@@ -6064,7 +6074,8 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                     f"--duration={duration}",
                     f"--poll={jimeng_poll_seconds()}",
                 ]
-                jimeng_append_model_resolution_args(args, payload, include_model=True)
+                # multiframe2video 不支持 --model_version 或 --video_resolution；
+                # 分辨率和模型由 CLI 根据首张参考图及默认配置处理。
         elif image_refs:
             image_path, created = await jimeng_prepare_local_media(jimeng_video_ref_url(image_refs[0]), "image")
             temp_paths.extend(created)
@@ -6094,12 +6105,14 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                 f"--prompt={payload.prompt}",
                 f"--duration={duration}",
                 f"--ratio={payload.aspect_ratio or '16:9'}",
-                f"--video_resolution={jimeng_video_resolution(payload.model, payload.resolution)}",
                 f"--poll={jimeng_poll_seconds()}",
             ]
             model_version = jimeng_video_model_version(payload.model)
             if model_version:
                 args.append(f"--model_version={model_version}")
+            resolution = jimeng_video_resolution_arg(payload.model, payload.resolution)
+            if resolution:
+                args.append(f"--video_resolution={resolution}")
         raw = await run_jimeng_cli(args, timeout=jimeng_poll_seconds() + 180)
         urls = await jimeng_store_outputs(raw, "video")
         return {"videos": urls, "task_id": jimeng_submit_id(raw) or None, "raw": raw}
